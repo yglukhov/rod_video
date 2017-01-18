@@ -1,6 +1,6 @@
 import rod.node
 import rod.component
-import rod.quaternion
+import rod.tools.serializer
 
 import nimx.context
 import nimx.portable_gl
@@ -8,9 +8,9 @@ import nimx.types
 import nimx.composition
 import nimx.resource
 
-import math
+import math, json
 
-import webm
+import webm.reader
 
 type VideoComponent* = ref object of Component
     yTex: TextureRef
@@ -69,11 +69,13 @@ proc newTex(): TextureRef =
     # gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     # gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 
+proc openVideoFile*(s: VideoComponent, path: string) =
+    if not s.webmReader.isNil:
+        s.webmReader.close()
+    s.webmReader = newReader(path)
+
 method init*(s: VideoComponent) =
     procCall s.Component.init()
-    let p = pathForResource("output.webm")
-    echo "Loading file: ", p
-    s.webmReader = newReader(pathForResource("out.webm")) #"/Users/yglukhov/Projects/rod_video/output.webm")
 
     s.yTex = newTex()
     let gl = currentContext().gl
@@ -166,14 +168,15 @@ proc nextDecodedImage(w: WebmReader): ptr vpx_image_t =
     if w.decodeNextFrame():
         result = w.frameImage()
 
-proc nextFrame(s: VideoComponent) =
-    var img = s.webmReader.nextDecodedImage()
+proc nextFrame(c: VideoComponent) =
+    if c.webmReader.isNil: return
+    var img = c.webmReader.nextDecodedImage()
     if img.isNil:
-        s.webmReader.rewind()
-        img = s.webmReader.nextDecodedImage()
+        c.webmReader.rewind()
+        img = c.webmReader.nextDecodedImage()
         assert(not img.isNil)
 
-    let alphaImg = s.webmReader.alphaImage()
+    let alphaImg = c.webmReader.alphaImage()
     #echo "ts: ", s.webmReader.frameTimestamp()
 
     let gl = currentContext().gl
@@ -181,32 +184,50 @@ proc nextFrame(s: VideoComponent) =
 
     let w = nextPowerOfTwo(img.d_w.int)
     let h = nextPowerOfTwo(img.d_w.int)
-    s.texWidth = w
-    s.texHeight = h
-    s.frameWidth = img.d_w.int
-    s.frameHeight = img.d_h.int
+    c.texWidth = w
+    c.texHeight = h
+    c.frameWidth = img.d_w.int
+    c.frameHeight = img.d_h.int
 
     #glPixelStorei(GL_UNPACK_ROW_LENGTH, img.stride[0])
     dataToTmpBuf(img.planes[0], img.stride[0].int, img.d_w.int, img.d_h.int, w, h)
-    gl.bindTexture(gl.TEXTURE_2D, s.yTex)
+    gl.bindTexture(gl.TEXTURE_2D, c.yTex)
     gl.texImage2D(gl.TEXTURE_2D, 0, format.GLint, GLsizei(w), GLsizei(h), 0, format, gl.UNSIGNED_BYTE, addr tmpBuf[0])
 
     let w2 = img.d_w.int div 2
     let h2 = img.d_h.int div 2
 #    glPixelStorei(GL_UNPACK_ROW_LENGTH, img.stride[1])
     dataToTmpBuf(img.planes[1], img.stride[1].int, w2, h2, w div 2, h div 2)
-    gl.bindTexture(gl.TEXTURE_2D, s.uTex)
+    gl.bindTexture(gl.TEXTURE_2D, c.uTex)
     gl.texImage2D(gl.TEXTURE_2D, 0, format.GLint, GLsizei(w div 2), GLsizei(h div 2), 0, format, gl.UNSIGNED_BYTE, addr tmpBuf[0])
 
 #    glPixelStorei(GL_UNPACK_ROW_LENGTH, img.stride[2])
     dataToTmpBuf(img.planes[2], img.stride[2].int, w2, h2, w div 2, h div 2)
-    gl.bindTexture(gl.TEXTURE_2D, s.vTex)
+    gl.bindTexture(gl.TEXTURE_2D, c.vTex)
     gl.texImage2D(gl.TEXTURE_2D, 0, format.GLint, GLsizei(w div 2), GLsizei(h div 2), 0, format, gl.UNSIGNED_BYTE, addr tmpBuf[0])
 
     if not alphaImg.isNil:
         dataToTmpBuf(alphaImg.planes[0], alphaImg.stride[0].int, alphaImg.d_w.int, alphaImg.d_h.int, w, h)
-        gl.bindTexture(gl.TEXTURE_2D, s.aTex)
+        gl.bindTexture(gl.TEXTURE_2D, c.aTex)
         gl.texImage2D(gl.TEXTURE_2D, 0, format.GLint, GLsizei(w), GLsizei(h), 0, format, gl.UNSIGNED_BYTE, addr tmpBuf[0])
+
+proc rewindToTime*(c: VideoComponent, t: float) =
+    if c.webmReader.isNil: return
+    c.webmReader.rewindToTime(t)
+    c.nextFrame()
+
+proc rewindToChapter*(c: VideoComponent, name: string) =
+    if c.webmReader.isNil: return
+    let chapters = c.webmReader.chapters()
+    var t: uint64
+    for c in chapters:
+        if c.name == name:
+            t = c.a
+    c.webmReader.rewindToNearestKeyframeAtTime(float(t) / 1000000000 + 0.1)
+
+method deserialize*(c: VideoComponent, j: JsonNode, s: Serializer) =
+    var v = j["fileName"]
+    c.openVideoFile(pathForResource(v.str))
 
 registerComponent(VideoComponent)
 
@@ -216,11 +237,14 @@ when isMainModule:
     import nimx.system_logger # Required because of Nim bug (#4433)
     import nimx.timer
     import nimx.mini_profiler
+    import nimx.slider, nimx.button
 
     import rod.viewport
     import rod.component.camera
+    import rod.quaternion
 
     import random
+    import times
 
     var allVideos = newSeq[VideoComponent]()
 
@@ -228,7 +252,9 @@ when isMainModule:
         let videoNode = rn.newChild("video")
         videoNode.position = newVector3(x, y)
         videoNode.scale = newVector3(0.05, 0.05, 0.05)
-        allVideos.add(videoNode.component(VideoComponent))
+        let c = videoNode.component(VideoComponent)
+        c.openVideoFile(pathForResource("out.webm"))
+        allVideos.add(c)
 
     proc startApplication() =
         var mainWindow = newWindow(newRect(40, 40, 1200, 600))
@@ -248,7 +274,7 @@ when isMainModule:
 
         let r = vp.rootNode
 
-        const coords = [(-50, 0), (-50, -33), (-18, 0), (-18, -33), (15, 0), (15, -33)]
+        const coords = [(-50, 0)]#, (-50, -33), (-18, 0), (-18, -33), (15, 0), (15, -33)]
 
         var rotationVectors = newSeq[float32](coords.len)
 
@@ -257,6 +283,18 @@ when isMainModule:
             if i < coords.len:
                 r.makeVideoNode(coords[i][0].float32, coords[i][1].float32)
                 rotationVectors[i] = 0 #random(0.5) - 0.25
+
+                if i == 0:
+                    let c = allVideos[0]
+                    for j, chap in c.webmReader.chapters:
+                        let b = Button.new(newRect(Coord(210 + j * 105), 5, 100, 25))
+                        closureScope:
+                            let name = chap.name
+                            b.title = "Chapter: " & name
+                            b.onAction do():
+                                c.rewindToChapter(name)
+                        vp.addSubview(b)
+
                 inc i
 
         mainWindow.addSubview(vp)
@@ -266,6 +304,15 @@ when isMainModule:
                 c.nextFrame()
                 #c.node.rotation = c.node.rotation * aroundZ(rotationVectors[i])
             vp.setNeedsDisplay()
+
+        let s = Slider.new(newRect(5, 5, 200, 25))
+        vp.addSubview(s)
+        s.onAction do():
+            for i, c in allVideos:
+                let st = epochTime()
+                c.rewindToTime(s.value)
+                echo "t: ", epochTime() - st
+
 
     runApplication:
         startApplication()
