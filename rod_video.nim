@@ -1,12 +1,5 @@
-import rod.node
-import rod.component
-import rod.tools.serializer
-
-import nimx.context
-import nimx.portable_gl
-import nimx.types
-import nimx.composition
-import nimx.resource
+import rod / [node, component, viewport, tools/serializer]
+import nimx / [context, portable_gl, types, composition, resource, animation]
 
 import math, json
 
@@ -18,8 +11,11 @@ type VideoComponent* = ref object of Component
     vTex: TextureRef
     aTex: TextureRef
     webmReader: WebmReader
+    animation: Animation
     frameWidth, frameHeight: int
     texWidth, texHeight: int
+    framerate: float
+    lastFrameTime: float
 
 var videoComposition = newComposition """
 uniform sampler2D uYTex;
@@ -69,22 +65,33 @@ proc newTex(): TextureRef =
     # gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     # gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 
-proc openVideoFile*(s: VideoComponent, path: string) =
-    if not s.webmReader.isNil:
-        s.webmReader.close()
-    s.webmReader = newReader(path)
+proc openVideoFile*(c: VideoComponent, path: string) =
+    if not c.webmReader.isNil:
+        c.webmReader.close()
+    c.webmReader = newReader(path)
+    c.framerate = 1 / c.webmReader.fps
+    echo "framerate: ", c.framerate
 
-method init*(s: VideoComponent) =
-    procCall s.Component.init()
+proc nextFrame(c: VideoComponent)
 
-    s.yTex = newTex()
+method init*(c: VideoComponent) =
+    procCall c.Component.init()
+
+    c.yTex = newTex()
     let gl = currentContext().gl
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
 
-    s.uTex = newTex()
-    s.vTex = newTex()
-    s.aTex = newTex()
+    c.uTex = newTex()
+    c.vTex = newTex()
+    c.aTex = newTex()
+
+    c.animation = newAnimation()
+    c.animation.onAnimate = proc(p: float) =
+        let curT = c.animation.curLoop.float + p
+        if c.lastFrameTime + c.framerate <= curT:
+            c.lastFrameTime = curT
+            c.nextFrame()
 
 method draw*(s: VideoComponent) =
     let c = currentContext()
@@ -97,6 +104,13 @@ method draw*(s: VideoComponent) =
         setUniform("uVTex", s.vTex)
         setUniform("uATex", s.aTex)
         setUniform("uUVk", uvk)
+
+method componentNodeWasAddedToSceneView*(c: VideoComponent) =
+    c.node.sceneView.addAnimation(c.animation)
+
+method componentNodeWillBeRemovedFromSceneView*(c: VideoComponent) =
+    c.node.sceneView.removeAnimation(c.animation)
+
 
 var tmpBuf = newSeq[uint8](10)
 
@@ -239,7 +253,6 @@ when isMainModule:
     import nimx.mini_profiler
     import nimx.slider, nimx.button
 
-    import rod.viewport
     import rod.component.camera
     import rod.quaternion
 
@@ -253,7 +266,7 @@ when isMainModule:
         videoNode.position = newVector3(x, y)
         videoNode.scale = newVector3(0.05, 0.05, 0.05)
         let c = videoNode.component(VideoComponent)
-        c.openVideoFile(pathForResource("out.webm"))
+        c.openVideoFile(pathForResource("seahorse.webm"))
         allVideos.add(c)
 
     proc startApplication() =
@@ -299,11 +312,11 @@ when isMainModule:
 
         mainWindow.addSubview(vp)
 
-        setInterval(1 / 30) do():
-            for i, c in allVideos:
-                c.nextFrame()
-                #c.node.rotation = c.node.rotation * aroundZ(rotationVectors[i])
-            vp.setNeedsDisplay()
+        # setInterval(1 / 30) do():
+        #     for i, c in allVideos:
+        #         c.nextFrame()
+        #         #c.node.rotation = c.node.rotation * aroundZ(rotationVectors[i])
+        #     vp.setNeedsDisplay()
 
         let s = Slider.new(newRect(5, 5, 200, 25))
         vp.addSubview(s)
