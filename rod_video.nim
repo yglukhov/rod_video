@@ -1,21 +1,25 @@
 import rod / [node, component, viewport, tools/serializer]
 import nimx / [context, portable_gl, types, composition, resource, animation]
 
-import math, json
+import math, json, times, heapqueue, logging
 
 import webm.reader
 
-type VideoComponent* = ref object of Component
-    yTex: TextureRef
-    uTex: TextureRef
-    vTex: TextureRef
-    aTex: TextureRef
-    webmReader: WebmReader
-    animation: Animation
-    frameWidth, frameHeight: int
-    texWidth, texHeight: int
-    framerate: float
-    lastFrameTime: float
+type
+    VideoComponentObj* = object of Component
+        yTex: TextureRef
+        uTex: TextureRef
+        vTex: TextureRef
+        aTex: TextureRef
+        webmReader: WebmReader
+        # animation: Animation
+        frameWidth, frameHeight: int
+        texWidth, texHeight: int
+        framerate: float
+        # lastFrameTime: float
+        nextFrameTime: float
+    VideoComponent = ref VideoComponentObj
+    VideoComponentPtr = ptr VideoComponentObj
 
 var videoComposition = newComposition """
 uniform sampler2D uYTex;
@@ -56,6 +60,11 @@ void compose() {
 }
 """
 
+proc `<`(x, y: VideoComponentPtr): bool {.inline.} =
+    x.nextFrameTime < y.nextFrameTime
+
+var allVideos = newHeapQueue[VideoComponentPtr]()
+
 proc newTex(): TextureRef =
     let gl = currentContext().gl
     result = gl.createTexture()
@@ -74,6 +83,28 @@ proc openVideoFile*(c: VideoComponent, path: string) =
 
 proc nextFrame(c: VideoComponent)
 
+var anim: Animation
+
+const maxDecodingTime = 0.02
+
+proc startAnimation(v: SceneView) =
+    anim = newAnimation()
+    anim.onAnimate = proc(p: float) =
+        var curTime = epochTime()
+        let deadline = curTime + maxDecodingTime
+        var i = 0
+        while curTime < deadline:
+            if allVideos[0].nextFrameTime > curTime:
+                return
+            let c = allVideos.pop()
+            c.nextFrameTime = curTime + c.framerate
+            cast[VideoComponent](c).nextFrame()
+            allVideos.push(c)
+            curTime = epochTime()
+            inc i
+        # echo "timeout on: ", i
+    v.addAnimation(anim)
+
 method init*(c: VideoComponent) =
     procCall c.Component.init()
 
@@ -85,13 +116,6 @@ method init*(c: VideoComponent) =
     c.uTex = newTex()
     c.vTex = newTex()
     c.aTex = newTex()
-
-    c.animation = newAnimation()
-    c.animation.onAnimate = proc(p: float) =
-        let curT = c.animation.curLoop.float + p
-        if c.lastFrameTime + c.framerate <= curT:
-            c.lastFrameTime = curT
-            c.nextFrame()
 
 method draw*(s: VideoComponent) =
     let c = currentContext()
@@ -106,11 +130,19 @@ method draw*(s: VideoComponent) =
         setUniform("uUVk", uvk)
 
 method componentNodeWasAddedToSceneView*(c: VideoComponent) =
-    c.node.sceneView.addAnimation(c.animation)
+    allVideos.push(cast[VideoComponentPtr](c))
+    if allVideos.len == 1:
+        startAnimation(c.node.sceneView)
+#    c.node.sceneView.addAnimation(c.animation)
 
 method componentNodeWillBeRemovedFromSceneView*(c: VideoComponent) =
-    c.node.sceneView.removeAnimation(c.animation)
-
+    doAssert(false)
+#    c.node.sceneView.removeAnimation(c.animation)
+    discard
+    # allVideos.del(allVideos.find(cast[VideoComponentPtr](c)))
+    # if allVideos.len == 0:
+    #     anim.cancel()
+    #     anim = nil
 
 var tmpBuf = newSeq[uint8](10)
 
@@ -259,7 +291,7 @@ when isMainModule:
     import random
     import times
 
-    var allVideos = newSeq[VideoComponent]()
+    var allVideoComps = newSeq[VideoComponent]()
 
     proc makeVideoNode(rn: Node, x, y: float32) =
         let videoNode = rn.newChild("video")
@@ -267,7 +299,7 @@ when isMainModule:
         videoNode.scale = newVector3(0.05, 0.05, 0.05)
         let c = videoNode.component(VideoComponent)
         c.openVideoFile(pathForResource("seahorse.webm"))
-        allVideos.add(c)
+        allVideoComps.add(c)
 
     proc startApplication() =
         var mainWindow = newWindow(newRect(40, 40, 1200, 600))
@@ -298,7 +330,7 @@ when isMainModule:
                 rotationVectors[i] = 0 #random(0.5) - 0.25
 
                 if i == 0:
-                    let c = allVideos[0]
+                    let c = allVideoComps[0]
                     for j, chap in c.webmReader.chapters:
                         let b = Button.new(newRect(Coord(210 + j * 105), 5, 100, 25))
                         closureScope:
@@ -313,7 +345,7 @@ when isMainModule:
         mainWindow.addSubview(vp)
 
         # setInterval(1 / 30) do():
-        #     for i, c in allVideos:
+        #     for i, c in allVideoComps:
         #         c.nextFrame()
         #         #c.node.rotation = c.node.rotation * aroundZ(rotationVectors[i])
         #     vp.setNeedsDisplay()
@@ -321,7 +353,7 @@ when isMainModule:
         let s = Slider.new(newRect(5, 5, 200, 25))
         vp.addSubview(s)
         s.onAction do():
-            for i, c in allVideos:
+            for i, c in allVideoComps:
                 let st = epochTime()
                 c.rewindToTime(s.value)
                 echo "t: ", epochTime() - st
